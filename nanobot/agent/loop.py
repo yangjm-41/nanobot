@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import json
 import os
 import time
 from collections.abc import Mapping
@@ -1676,6 +1677,11 @@ class AgentLoop:
     async def _state_save(self, ctx: TurnContext) -> str:
         turn_continuation.prepare_save_boundary(ctx)
 
+        tool_suspended = ctx.stop_reason == "tool_suspended"
+        if tool_suspended:
+            ctx.final_content = ""
+            ctx.suppress_response = True
+
         if (
             (ctx.final_content is None or not ctx.final_content.strip())
             and not ctx.suppress_response
@@ -1711,7 +1717,8 @@ class AgentLoop:
                 )
             )
         self._clear_pending_user_turn(ctx.session)
-        self._clear_runtime_checkpoint(ctx.session)
+        if not tool_suspended:
+            self._clear_runtime_checkpoint(ctx.session)
         self.sessions.save(ctx.session)
         return "ok"
 
@@ -1892,6 +1899,8 @@ class AgentLoop:
         checkpoint = session.metadata.get(self._RUNTIME_CHECKPOINT_KEY)
         if not isinstance(checkpoint, dict):
             return False
+        if checkpoint.get("phase") == "tool_suspended":
+            return False
 
         assistant_message = checkpoint.get("assistant_message")
         completed_tool_results = checkpoint.get("completed_tool_results") or []
@@ -2015,3 +2024,121 @@ class AgentLoop:
         finally:
             await self._runtime_events().run_status_changed(msg, session_key, "idle")
             self._runtime_events().clear_turn(session_key)
+
+    async def resume_tool_result(
+        self,
+        *,
+        session_key: str,
+        suspension_id: str,
+        tool_result: Any,
+        channel: str = "cli",
+        chat_id: str = "direct",
+        on_stream: Callable[[str], Awaitable[None]] | None = None,
+        on_stream_end: Callable[..., Awaitable[None]] | None = None,
+        hooks: list[AgentHook] | None = None,
+        tools: ToolRegistry | None = None,
+        runtime: LLMRuntime | None = None,
+    ) -> OutboundMessage | None:
+        """Resume a suspended tool call without creating a synthetic user turn."""
+        await self._connect_mcp()
+        lock = self._session_locks.setdefault(session_key, asyncio.Lock())
+        async with lock:
+            session = self.sessions.get_or_create(session_key)
+            completed = session.metadata.setdefault("completed_tool_suspensions", {})
+            prior = completed.get(suspension_id) if isinstance(completed, dict) else None
+            if isinstance(prior, dict) and prior.get("state") == "completed":
+                content = str(prior.get("content") or "")
+                return OutboundMessage(channel=channel, chat_id=chat_id, content=content)
+
+            checkpoint = session.metadata.get(self._RUNTIME_CHECKPOINT_KEY)
+            if not isinstance(checkpoint, dict) or checkpoint.get("phase") != "tool_suspended":
+                raise RuntimeError("No suspended tool call exists for this session")
+            suspension = checkpoint.get("suspension")
+            if not isinstance(suspension, dict) or suspension.get("suspension_id") != suspension_id:
+                raise ValueError("Suspension does not match the session checkpoint")
+
+            tool_call_id = str(suspension.get("tool_call_id") or "")
+            tool_name = str(suspension.get("tool_name") or "tool")
+            if not tool_call_id:
+                raise RuntimeError("Suspended checkpoint is missing tool_call_id")
+            if not any(
+                call.get("id") == tool_call_id
+                for message in session.messages
+                for call in (message.get("tool_calls") or [])
+                if isinstance(call, dict)
+            ):
+                assistant_message = checkpoint.get("assistant_message")
+                if not isinstance(assistant_message, dict):
+                    raise RuntimeError("Suspended checkpoint is missing the assistant tool call")
+                self._save_turn(session, [assistant_message], 0)
+
+            if isinstance(tool_result, str):
+                content = tool_result
+            else:
+                content = json.dumps(tool_result, ensure_ascii=False, separators=(",", ":"))
+            if not any(
+                message.get("role") == "tool"
+                and message.get("tool_call_id") == tool_call_id
+                for message in session.messages
+            ):
+                self._save_turn(
+                    session,
+                    [{
+                        "role": "tool",
+                        "tool_call_id": tool_call_id,
+                        "name": tool_name,
+                        "content": content,
+                    }],
+                    0,
+                )
+
+            completed[suspension_id] = {"state": "resuming"}
+            self._clear_runtime_checkpoint(session)
+            self.sessions.save(session)
+
+            runtime = runtime or self.llm_runtime()
+            history = session.get_history(
+                max_messages=replay_max_messages_for_context(runtime.context_window_tokens),
+                max_tokens=self._replay_token_budget(runtime),
+                extend_to_user=False,
+            )
+            bootstrap = self.context.build_messages(
+                history=[],
+                current_message="",
+                channel=channel,
+                chat_id=chat_id,
+                session_metadata=session.metadata,
+                workspace=self.workspace,
+                session_key=session_key,
+                unified_session=self._unified_session,
+            )
+            initial_messages = [bootstrap[0], *history]
+            final_content, _, all_messages, stop_reason, _ = await self._run_agent_loop(
+                initial_messages,
+                runtime=runtime,
+                on_stream=on_stream,
+                on_stream_end=on_stream_end,
+                session=session,
+                channel=channel,
+                chat_id=chat_id,
+                session_key=session_key,
+                original_user_text=None,
+                hooks=hooks,
+                tools=tools,
+            )
+            self._save_turn(session, all_messages, len(initial_messages))
+            if stop_reason != "tool_suspended":
+                self._clear_runtime_checkpoint(session)
+            completed[suspension_id] = {
+                "state": "completed",
+                "content": final_content or "",
+                "stop_reason": stop_reason,
+            }
+            self.sessions.save(session)
+            if stop_reason == "tool_suspended":
+                return None
+            return OutboundMessage(
+                channel=channel,
+                chat_id=chat_id,
+                content=final_content or "",
+            )
