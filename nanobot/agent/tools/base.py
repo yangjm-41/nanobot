@@ -144,6 +144,22 @@ class ToolResult(str):
         return cls(content, is_error=True)
 
 
+class ToolSuspension(Exception):
+    """Request a durable pause while a tool waits for external input.
+
+    Tools should raise this exception instead of blocking.  The runner stores
+    the original tool call and ends the run with ``tool_suspended`` so callers
+    can later resume it with a result for the same ``tool_call_id``.
+    """
+
+    def __init__(self, suspension_id: str, metadata: dict[str, Any] | None = None) -> None:
+        if not suspension_id.strip():
+            raise ValueError("suspension_id must not be empty")
+        self.suspension_id = suspension_id
+        self.metadata = deepcopy(metadata or {})
+        super().__init__(f"Tool suspended: {suspension_id}")
+
+
 class Tool(ABC):
     """Agent capability: read files, run commands, etc."""
 
