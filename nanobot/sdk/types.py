@@ -17,6 +17,7 @@ StreamEventType: TypeAlias = Literal[
     "tool.started",
     "tool.completed",
     "tool.failed",
+    "tool.suspended",
     "run.completed",
     "run.failed",
 ]
@@ -29,6 +30,7 @@ STREAM_EVENT_REASONING_COMPLETED: StreamEventType = "reasoning.completed"
 STREAM_EVENT_TOOL_STARTED: StreamEventType = "tool.started"
 STREAM_EVENT_TOOL_COMPLETED: StreamEventType = "tool.completed"
 STREAM_EVENT_TOOL_FAILED: StreamEventType = "tool.failed"
+STREAM_EVENT_TOOL_SUSPENDED: StreamEventType = "tool.suspended"
 STREAM_EVENT_RUN_COMPLETED: StreamEventType = "run.completed"
 STREAM_EVENT_RUN_FAILED: StreamEventType = "run.failed"
 
@@ -41,6 +43,7 @@ STREAM_EVENT_TYPES: tuple[StreamEventType, ...] = (
     STREAM_EVENT_TOOL_STARTED,
     STREAM_EVENT_TOOL_COMPLETED,
     STREAM_EVENT_TOOL_FAILED,
+    STREAM_EVENT_TOOL_SUSPENDED,
     STREAM_EVENT_RUN_COMPLETED,
     STREAM_EVENT_RUN_FAILED,
 )
@@ -162,6 +165,8 @@ def snapshot_from_payload(
 def result_from_response(response: Any, capture: Any) -> RunResult:
     content = (response.content if response else None) or ""
     metadata = dict(response.metadata) if response and response.metadata else {}
+    if capture.suspension is not None:
+        metadata["tool_suspension"] = deepcopy(capture.suspension)
     return RunResult(
         content=content,
         tools_used=capture.tools_used,
