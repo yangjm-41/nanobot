@@ -19,6 +19,7 @@ from nanobot.agent.context_governance import (
 )
 from nanobot.agent.hook import AgentHook, AgentHookContext, AgentRunHookContext
 from nanobot.agent.tools.registry import ToolRegistry, is_tool_error_result
+from nanobot.agent.tools.base import ToolSuspension
 from nanobot.providers.base import LLMProvider, LLMResponse, ToolCallRequest
 from nanobot.session.history_visibility import is_hidden_history_message
 from nanobot.utils.helpers import (
@@ -97,6 +98,16 @@ class AgentRunResult:
     error: str | None = None
     tool_events: list[dict[str, str]] = field(default_factory=list)
     had_injections: bool = False
+    suspension: dict[str, Any] | None = None
+
+
+class _ToolCallSuspended(Exception):
+    """Internal carrier that associates a suspension with its model tool call."""
+
+    def __init__(self, tool_call: ToolCallRequest, suspension: ToolSuspension) -> None:
+        self.tool_call = tool_call
+        self.suspension = suspension
+        super().__init__(str(suspension))
 
 
 class AgentRunner:
@@ -301,6 +312,7 @@ class AgentRunner:
             context.error = result.error
             context.tool_events = deepcopy(result.tool_events)
             context.had_injections = result.had_injections
+            context.suspension = deepcopy(result.suspension)
             context.exception = None
             if context.error is not None:
                 await hook.on_error(context)
@@ -337,6 +349,7 @@ class AgentRunner:
         empty_content_retries = 0
         length_recovery_count = 0
         had_injections = False
+        suspension: dict[str, Any] | None = None
         injection_cycles = 0
         compacted_tool_call_ids: set[str] = set()
         governance_config = ContextGovernanceConfig(
@@ -434,14 +447,42 @@ class AgentRunner:
 
                 await hook.before_execute_tools(context)
 
-                results, new_events, fatal_error = await self._execute_tools(
-                    spec,
-                    response.tool_calls,
-                    external_lookup_counts,
-                    workspace_violation_counts,
-                    hook,
-                    context,
-                )
+                try:
+                    results, new_events, fatal_error = await self._execute_tools(
+                        spec,
+                        response.tool_calls,
+                        external_lookup_counts,
+                        workspace_violation_counts,
+                        hook,
+                        context,
+                    )
+                except _ToolCallSuspended as exc:
+                    suspension = {
+                        "suspension_id": exc.suspension.suspension_id,
+                        "tool_call_id": exc.tool_call.id,
+                        "tool_name": exc.tool_call.name,
+                        "arguments": deepcopy(exc.tool_call.arguments),
+                        "metadata": deepcopy(exc.suspension.metadata),
+                    }
+                    context.suspension = deepcopy(suspension)
+                    context.stop_reason = "tool_suspended"
+                    final_content = ""
+                    stop_reason = "tool_suspended"
+                    await self._emit_checkpoint(
+                        spec,
+                        {
+                            "phase": "tool_suspended",
+                            "iteration": iteration,
+                            "model": spec.runtime.model,
+                            "assistant_message": assistant_message,
+                            "completed_tool_results": [],
+                            "pending_tool_calls": [exc.tool_call.to_openai_tool_call()],
+                            "suspension": deepcopy(suspension),
+                        },
+                    )
+                    await hook.on_tool_suspended(context, exc.tool_call, suspension)
+                    await hook.after_iteration(context)
+                    break
                 tool_events.extend(new_events)
                 tools_used.extend(
                     tool_call.name
@@ -686,6 +727,7 @@ class AgentRunner:
             error=error,
             tool_events=tool_events,
             had_injections=had_injections,
+            suspension=suspension,
         )
 
     def _build_request_kwargs(
@@ -1190,6 +1232,8 @@ class AgentRunner:
                 result = await spec.tools.execute(tool_call.name, params)
         except asyncio.CancelledError:
             raise
+        except ToolSuspension as exc:
+            raise _ToolCallSuspended(tool_call, exc) from exc
         except BaseException as exc:
             await hook.on_execute_tool_error(context, tool_call, tool, params, exc)
             event = {
