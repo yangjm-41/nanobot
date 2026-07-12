@@ -16,6 +16,7 @@ from nanobot.sdk.types import (
     STREAM_EVENT_TOOL_COMPLETED,
     STREAM_EVENT_TOOL_FAILED,
     STREAM_EVENT_TOOL_STARTED,
+    STREAM_EVENT_TOOL_SUSPENDED,
     RunResult,
     StreamEvent,
 )
@@ -220,3 +221,18 @@ class SDKStreamingHook(AgentHook):
                 error=None if status == "ok" else str(event.get("detail") or ""),
                 metadata=event,
             ))
+
+    async def on_tool_suspended(
+        self,
+        context: AgentHookContext,
+        tool_call: Any,
+        suspension: dict[str, Any],
+    ) -> None:
+        await self._emitter.emit(StreamEvent(
+            type=STREAM_EVENT_TOOL_SUSPENDED,
+            name=tool_call.name,
+            tool_call_id=tool_call.id,
+            arguments=deepcopy(tool_call.arguments),
+            iteration=context.iteration,
+            metadata=deepcopy(suspension),
+        ))
