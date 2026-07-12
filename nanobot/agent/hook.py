@@ -29,6 +29,7 @@ class AgentHookContext:
     stop_reason: str | None = None
     error: str | None = None
     session_key: str | None = None
+    suspension: dict[str, Any] | None = None
 
 
 @dataclass(slots=True)
@@ -43,6 +44,7 @@ class AgentRunHookContext:
     error: str | None = None
     tool_events: list[dict[str, str]] = field(default_factory=list)
     had_injections: bool = False
+    suspension: dict[str, Any] | None = None
     exception: BaseException | None = None
 
 
@@ -119,6 +121,14 @@ class AgentHook:
         tool: Any,
         params: Any,
         error: Any,
+    ) -> None:
+        pass
+
+    async def on_tool_suspended(
+        self,
+        context: AgentHookContext,
+        tool_call: ToolCallRequest,
+        suspension: dict[str, Any],
     ) -> None:
         pass
 
@@ -238,6 +248,16 @@ class CompositeHook(AgentHook):
             error,
         )
 
+    async def on_tool_suspended(
+        self,
+        context: AgentHookContext,
+        tool_call: ToolCallRequest,
+        suspension: dict[str, Any],
+    ) -> None:
+        await self._for_each_hook_safe(
+            "on_tool_suspended", context, tool_call, suspension
+        )
+
     async def emit_reasoning(self, reasoning_content: str | None) -> None:
         await self._for_each_hook_safe("emit_reasoning", reasoning_content)
 
@@ -272,6 +292,7 @@ class SDKCaptureHook(AgentHook):
         self.error: str | None = None
         self.tool_events: list[dict[str, str]] = []
         self.had_injections: bool = False
+        self.suspension: dict[str, Any] | None = None
 
     async def after_iteration(self, context: AgentHookContext) -> None:
         for call in context.tool_calls:
@@ -281,6 +302,9 @@ class SDKCaptureHook(AgentHook):
         self.stop_reason = context.stop_reason
         self.error = context.error
         self.tool_events = list(context.tool_events)
+        self.suspension = (
+            dict(context.suspension) if context.suspension is not None else None
+        )
 
     async def after_run(self, context: AgentRunHookContext) -> None:
         self.tools_used = list(context.tools_used)
@@ -290,3 +314,6 @@ class SDKCaptureHook(AgentHook):
         self.error = context.error
         self.tool_events = list(context.tool_events)
         self.had_injections = context.had_injections
+        self.suspension = (
+            dict(context.suspension) if context.suspension is not None else None
+        )
