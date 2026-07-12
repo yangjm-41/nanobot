@@ -29,6 +29,7 @@ from nanobot.sdk.types import (
     STREAM_EVENT_TOOL_COMPLETED,
     STREAM_EVENT_TOOL_FAILED,
     STREAM_EVENT_TOOL_STARTED,
+    STREAM_EVENT_TOOL_SUSPENDED,
     STREAM_EVENT_TYPES,
     RunResult,
     SessionInfo,
@@ -54,6 +55,7 @@ __all__ = [
     "STREAM_EVENT_TOOL_COMPLETED",
     "STREAM_EVENT_TOOL_FAILED",
     "STREAM_EVENT_TOOL_STARTED",
+    "STREAM_EVENT_TOOL_SUSPENDED",
     "STREAM_EVENT_TYPES",
     "StreamEvent",
     "StreamEventType",
@@ -295,6 +297,80 @@ class Nanobot:
         finally:
             if not run.done:
                 await run.aclose()
+
+    async def resume_tool_streamed(
+        self,
+        *,
+        session_key: str,
+        suspension_id: str,
+        tool_result: Any,
+        channel: str = "cli",
+        chat_id: str = "direct",
+        hooks: list[AgentHook] | None = None,
+        model: str | None = None,
+        model_preset: str | None = None,
+    ) -> RunStream:
+        """Resume the original suspended tool call and stream the continuation."""
+        runtime = self._loop.runtime_resolver.resolve_override(
+            model=model,
+            model_preset=model_preset,
+            config=self._config,
+        ) or self._loop.llm_runtime()
+        queue: asyncio.Queue[StreamEvent | object] = asyncio.Queue(maxsize=256)
+        emitter = SDKStreamEmitter(queue)
+        stream_hook = SDKStreamingHook(emitter)
+        capture = SDKCaptureHook()
+        per_run_hooks = [capture, stream_hook, *(hooks or [])]
+
+        async def _on_stream(delta: str) -> None:
+            await emitter.text_delta(delta)
+
+        async def _on_stream_end(*_args: Any, resuming: bool = False, **_kwargs: Any) -> None:
+            await emitter.text_completed(resuming=resuming)
+
+        async def _run() -> RunResult:
+            await emitter.emit(StreamEvent(
+                type=STREAM_EVENT_RUN_STARTED,
+                metadata={
+                    "session_key": session_key,
+                    "suspension_id": suspension_id,
+                    "resumed": True,
+                    "model": runtime.model,
+                },
+            ))
+            try:
+                response = await self._loop.resume_tool_result(
+                    session_key=session_key,
+                    suspension_id=suspension_id,
+                    tool_result=tool_result,
+                    channel=channel,
+                    chat_id=chat_id,
+                    on_stream=_on_stream,
+                    on_stream_end=_on_stream_end,
+                    hooks=per_run_hooks,
+                    runtime=runtime,
+                )
+                await emitter.text_completed(resuming=False, force=False)
+                result = result_from_response(response, capture)
+                await emitter.emit(StreamEvent(
+                    type=STREAM_EVENT_RUN_COMPLETED,
+                    content=result.content,
+                    result=result,
+                    usage=dict(result.usage),
+                    metadata=dict(result.metadata),
+                ))
+                return result
+            except Exception as exc:
+                await emitter.emit(StreamEvent(
+                    type=STREAM_EVENT_RUN_FAILED,
+                    error=str(exc),
+                    metadata={"exception_type": type(exc).__name__},
+                ))
+                raise
+            finally:
+                emitter.close()
+
+        return RunStream(asyncio.create_task(_run()), queue)
 
     async def aclose(self) -> None:
         """Release resources held by this instance (MCP connections, etc.)."""
