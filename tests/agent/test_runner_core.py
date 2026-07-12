@@ -74,6 +74,55 @@ async def test_runner_preserves_reasoning_fields_and_tool_results():
 
 
 @pytest.mark.asyncio
+async def test_runner_suspends_tool_without_emitting_error_or_calling_model_again():
+    from nanobot.agent.runner import AgentRunner
+    from nanobot.agent.tools.base import ToolSuspension
+
+    provider = MagicMock(spec=LLMProvider)
+    provider.chat_with_retry = AsyncMock(return_value=LLMResponse(
+        content="",
+        tool_calls=[ToolCallRequest(
+            id="call_suspend",
+            name="collect_input",
+            arguments={"city": "Shanghai"},
+        )],
+    ))
+    tools = MagicMock()
+    tools.get_definitions.return_value = []
+    tools.execute = AsyncMock(side_effect=ToolSuspension(
+        "invocation-1",
+        {"status": "input_required", "missing": ["destination"]},
+    ))
+    checkpoint = AsyncMock()
+
+    result = await AgentRunner().run(make_run_spec(
+        provider,
+        initial_messages=[{"role": "user", "content": "book a ride"}],
+        tools=tools,
+        model="test-model",
+        max_iterations=3,
+        max_tool_result_chars=_MAX_TOOL_RESULT_CHARS,
+        checkpoint_callback=checkpoint,
+    ))
+
+    assert result.stop_reason == "tool_suspended"
+    assert result.error is None
+    assert result.final_content == ""
+    assert result.suspension == {
+        "suspension_id": "invocation-1",
+        "tool_call_id": "call_suspend",
+        "tool_name": "collect_input",
+        "arguments": {"city": "Shanghai"},
+        "metadata": {"status": "input_required", "missing": ["destination"]},
+    }
+    assert provider.chat_with_retry.await_count == 1
+    assert not any(message.get("role") == "tool" for message in result.messages)
+    suspended_checkpoint = checkpoint.await_args_list[-1].args[0]
+    assert suspended_checkpoint["phase"] == "tool_suspended"
+    assert suspended_checkpoint["pending_tool_calls"][0]["id"] == "call_suspend"
+
+
+@pytest.mark.asyncio
 async def test_runner_returns_max_iterations_fallback():
     from nanobot.agent.runner import AgentRunner
 
