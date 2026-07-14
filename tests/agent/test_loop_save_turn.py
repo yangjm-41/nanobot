@@ -664,6 +664,81 @@ def test_restore_runtime_checkpoint_dedupes_overlapping_tail() -> None:
 
 
 @pytest.mark.asyncio
+async def test_resume_tool_result_survives_restart_and_is_idempotent(
+    tmp_path: Path,
+) -> None:
+    session_key = "sdk:capability-resume"
+    suspension_id = "invocation-1"
+    tool_call_id = "call-capability-1"
+    first_loop = _make_full_loop(tmp_path)
+    session = first_loop.sessions.get_or_create(session_key)
+    session.metadata[AgentLoop._RUNTIME_CHECKPOINT_KEY] = {
+        "phase": "tool_suspended",
+        "assistant_message": {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{
+                "id": tool_call_id,
+                "type": "function",
+                "function": {
+                    "name": "purchase_movie_ticket",
+                    "arguments": '{"movie":"海贼王"}',
+                },
+            }],
+        },
+        "completed_tool_results": [],
+        "pending_tool_calls": [],
+        "suspension": {
+            "suspension_id": suspension_id,
+            "tool_call_id": tool_call_id,
+            "tool_name": "purchase_movie_ticket",
+            "arguments": {"movie": "海贼王"},
+            "metadata": {"status": "confirmation_required"},
+        },
+    }
+    first_loop.sessions.save(session)
+
+    restarted_loop = _make_full_loop(tmp_path)
+
+    async def continue_after_tool(messages, **_kwargs):
+        return (
+            "购买成功",
+            [],
+            [*messages, {"role": "assistant", "content": "购买成功"}],
+            "stop",
+            False,
+        )
+
+    restarted_loop._run_agent_loop = AsyncMock(side_effect=continue_after_tool)  # type: ignore[method-assign]
+
+    first_result = await restarted_loop.resume_tool_result(
+        session_key=session_key,
+        suspension_id=suspension_id,
+        tool_result={"status": "succeeded", "text": "购买成功"},
+    )
+    repeated_result = await restarted_loop.resume_tool_result(
+        session_key=session_key,
+        suspension_id=suspension_id,
+        tool_result={"status": "succeeded", "text": "购买成功"},
+    )
+
+    assert first_result is not None
+    assert first_result.content == "购买成功"
+    assert repeated_result is not None
+    assert repeated_result.content == "购买成功"
+    assert restarted_loop._run_agent_loop.await_count == 1
+    restarted_loop.sessions.invalidate(session_key)
+    persisted = restarted_loop.sessions.get_or_create(session_key)
+    assert [message["role"] for message in persisted.messages] == [
+        "assistant",
+        "tool",
+        "assistant",
+    ]
+    assert persisted.messages[1]["tool_call_id"] == tool_call_id
+    assert persisted.metadata.get(AgentLoop._RUNTIME_CHECKPOINT_KEY) is None
+
+
+@pytest.mark.asyncio
 async def test_process_message_persists_user_message_before_turn_completes(tmp_path: Path) -> None:
     loop = _make_full_loop(tmp_path)
     loop.consolidator.maybe_consolidate_by_tokens = AsyncMock(return_value=False)  # type: ignore[method-assign]

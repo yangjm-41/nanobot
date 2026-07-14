@@ -21,6 +21,7 @@ from nanobot.nanobot import (
     STREAM_EVENT_TOOL_COMPLETED,
     STREAM_EVENT_TOOL_FAILED,
     STREAM_EVENT_TOOL_STARTED,
+    STREAM_EVENT_TOOL_SUSPENDED,
     STREAM_EVENT_TYPES,
     Nanobot,
     RunResult,
@@ -281,6 +282,7 @@ def test_stream_event_constants_are_stable():
         STREAM_EVENT_TOOL_STARTED,
         STREAM_EVENT_TOOL_COMPLETED,
         STREAM_EVENT_TOOL_FAILED,
+        STREAM_EVENT_TOOL_SUSPENDED,
         STREAM_EVENT_RUN_COMPLETED,
         STREAM_EVENT_RUN_FAILED,
     )
@@ -293,6 +295,7 @@ def test_stream_event_constants_are_stable():
         "tool.started",
         "tool.completed",
         "tool.failed",
+        "tool.suspended",
         "run.completed",
         "run.failed",
     )
@@ -921,6 +924,62 @@ async def test_run_streamed_forwards_runtime_options(tmp_path):
     assert callable(kwargs["on_stream_end"])
     assert kwargs["hooks"]
     assert kwargs["runtime"] is bot._loop.runtime_resolver.runtime
+
+
+@pytest.mark.asyncio
+async def test_run_streamed_applies_per_run_tool_controls(tmp_path):
+    from nanobot.agent.tools.base import Tool
+    from nanobot.bus.events import OutboundMessage
+
+    class _Tool(Tool):
+        @property
+        def name(self):
+            return "book_ticket"
+
+        @property
+        def description(self):
+            return "Book a ticket"
+
+        @property
+        def parameters(self):
+            return {"type": "object", "properties": {}}
+
+        async def execute(self, **kwargs):
+            return kwargs
+
+    config_path = _write_config(tmp_path)
+    bot = Nanobot.from_config(config_path, workspace=tmp_path)
+    bot._loop.tools.register(_Tool())
+    bot._loop.process_direct = AsyncMock(
+        return_value=OutboundMessage(channel="sdk", chat_id="chat-a", content="ok"),
+    )
+
+    run = await bot.run_streamed(
+        "buy tickets",
+        tool_allowlist=["book_ticket"],
+        required_tool_name="book_ticket",
+    )
+    await run.wait()
+
+    kwargs = bot._loop.process_direct.await_args.kwargs
+    assert kwargs["tools"].tool_names == ["book_ticket"]
+    assert kwargs["initial_tool_choice"] == {
+        "type": "function",
+        "function": {"name": "book_ticket"},
+    }
+
+
+@pytest.mark.asyncio
+async def test_run_streamed_rejects_invalid_tool_controls(tmp_path):
+    config_path = _write_config(tmp_path)
+    bot = Nanobot.from_config(config_path, workspace=tmp_path)
+
+    with pytest.raises(ValueError, match="required_tool_name"):
+        await bot.run_streamed(
+            "buy tickets",
+            tool_allowlist=["read_file"],
+            required_tool_name="book_ticket",
+        )
 
 
 @pytest.mark.asyncio

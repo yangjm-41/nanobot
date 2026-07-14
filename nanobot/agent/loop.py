@@ -159,6 +159,7 @@ class TurnContext:
     hook_factories: list[AgentTurnHookFactory] = field(default_factory=list)
     turn_scopes: list[AbstractContextManager[Any]] = field(default_factory=list)
     tools: ToolRegistry | None = None
+    initial_tool_choice: str | dict[str, Any] | None = None
 
     turn_wall_started_at: float = field(default_factory=time.time)
     visible_run_started_at: float | None = None
@@ -781,6 +782,7 @@ class AgentLoop:
         hook_factories: list[AgentTurnHookFactory] | None = None,
         turn_scopes: list[AbstractContextManager[Any]] | None = None,
         tools: ToolRegistry | None = None,
+        initial_tool_choice: str | dict[str, Any] | None = None,
         request_context: RequestContext | None = None,
     ) -> tuple[str | None, list[str], list[dict], str, bool]:
         """Run the agent iteration loop.
@@ -952,6 +954,7 @@ class AgentLoop:
                     session_metadata=session_metadata,
                     message_metadata=metadata,
                 ),
+                initial_tool_choice=initial_tool_choice,
             ))
         finally:
             turn_scope_stack.close()
@@ -1369,6 +1372,7 @@ class AgentLoop:
         hooks: list[AgentHook] | None = None,
         hook_factories: list[AgentTurnHookFactory] | None = None,
         tools: ToolRegistry | None = None,
+        initial_tool_choice: str | dict[str, Any] | None = None,
         runtime: LLMRuntime | None = None,
     ) -> OutboundMessage | None:
         """Process a single inbound message and return the response."""
@@ -1414,6 +1418,7 @@ class AgentLoop:
             hooks=list(hooks or []),
             hook_factories=list(hook_factories or []),
             tools=tools,
+            initial_tool_choice=initial_tool_choice,
         )
 
         while ctx.state is not TurnState.DONE:
@@ -1663,6 +1668,7 @@ class AgentLoop:
             hook_factories=ctx.hook_factories,
             turn_scopes=ctx.turn_scopes,
             tools=ctx.tools,
+            initial_tool_choice=ctx.initial_tool_choice,
             request_context=ctx.request_context,
         )
         final_content, tools_used, all_msgs, stop_reason, had_injections = result
@@ -1984,6 +1990,7 @@ class AgentLoop:
         hooks: list[AgentHook] | None = None,
         hook_factories: list[AgentTurnHookFactory] | None = None,
         tools: ToolRegistry | None = None,
+        initial_tool_choice: str | dict[str, Any] | None = None,
         persist_user_message: bool = True,
         runtime: LLMRuntime | None = None,
     ) -> OutboundMessage | None:
@@ -2015,6 +2022,8 @@ class AgentLoop:
                     kwargs["hook_factories"] = hook_factories
                 if tools is not None:
                     kwargs["tools"] = tools
+                if initial_tool_choice is not None:
+                    kwargs["initial_tool_choice"] = initial_tool_choice
                 if runtime is not None:
                     kwargs["runtime"] = runtime
                 return await self._process_message(
@@ -2037,6 +2046,7 @@ class AgentLoop:
         on_stream_end: Callable[..., Awaitable[None]] | None = None,
         hooks: list[AgentHook] | None = None,
         tools: ToolRegistry | None = None,
+        initial_tool_choice: str | dict[str, Any] | None = None,
         runtime: LLMRuntime | None = None,
     ) -> OutboundMessage | None:
         """Resume a suspended tool call without creating a synthetic user turn."""
@@ -2125,6 +2135,7 @@ class AgentLoop:
                 original_user_text=None,
                 hooks=hooks,
                 tools=tools,
+                initial_tool_choice=initial_tool_choice,
             )
             self._save_turn(session, all_messages, len(initial_messages))
             if stop_reason != "tool_suspended":

@@ -18,8 +18,8 @@ from nanobot.agent.context_governance import (
     ContextGovernor,
 )
 from nanobot.agent.hook import AgentHook, AgentHookContext, AgentRunHookContext
-from nanobot.agent.tools.registry import ToolRegistry, is_tool_error_result
 from nanobot.agent.tools.base import ToolSuspension
+from nanobot.agent.tools.registry import ToolRegistry, is_tool_error_result
 from nanobot.providers.base import LLMProvider, LLMResponse, ToolCallRequest
 from nanobot.session.history_visibility import is_hidden_history_message
 from nanobot.utils.helpers import (
@@ -84,6 +84,7 @@ class AgentRunSpec:
     goal_active_predicate: Callable[[], bool] | None = None
     goal_continue_message: GoalContinueMessage | None = None
     finalize_on_max_iterations: bool = True
+    initial_tool_choice: str | dict[str, Any] | None = None
 
 
 @dataclass(slots=True)
@@ -101,7 +102,7 @@ class AgentRunResult:
     suspension: dict[str, Any] | None = None
 
 
-class _ToolCallSuspended(Exception):
+class _ToolCallSuspendedError(Exception):
     """Internal carrier that associates a suspension with its model tool call."""
 
     def __init__(self, tool_call: ToolCallRequest, suspension: ToolSuspension) -> None:
@@ -352,6 +353,7 @@ class AgentRunner:
         suspension: dict[str, Any] | None = None
         injection_cycles = 0
         compacted_tool_call_ids: set[str] = set()
+        pending_required_tool_name: str | None = None
         governance_config = ContextGovernanceConfig(
             provider=spec.runtime.provider,
             model=spec.runtime.model,
@@ -402,6 +404,8 @@ class AgentRunner:
                 messages=messages,
                 session_key=spec.session_key,
             )
+            context.directive.required_tool_name_once = pending_required_tool_name
+            pending_required_tool_name = None
             await hook.before_iteration(context)
             response = await self._request_model(spec, messages_for_model, hook, context)
             context.response = response
@@ -456,7 +460,7 @@ class AgentRunner:
                         hook,
                         context,
                     )
-                except _ToolCallSuspended as exc:
+                except _ToolCallSuspendedError as exc:
                     suspension = {
                         "suspension_id": exc.suspension.suspension_id,
                         "tool_call_id": exc.tool_call.id,
@@ -627,12 +631,28 @@ class AgentRunner:
             if should_continue:
                 had_injections = True
 
-            if hook.wants_streaming():
-                await hook.on_stream_end(context, resuming=should_continue)
-
             if should_continue:
+                if hook.wants_streaming():
+                    await hook.on_stream_end(context, resuming=True)
                 await hook.after_iteration(context)
                 continue
+
+            context.final_content = clean
+            context.stop_reason = stop_reason
+            await hook.before_final_response(context)
+            if context.directive.discard_final_response_and_continue:
+                pending_required_tool_name = (
+                    context.directive.required_tool_name_once
+                    or context.required_tool_name_once
+                )
+                context.final_content = None
+                context.stop_reason = None
+                if hook.wants_streaming():
+                    await hook.on_stream_end(context, resuming=True)
+                await hook.after_iteration(context)
+                continue
+            if hook.wants_streaming():
+                await hook.on_stream_end(context, resuming=False)
 
             if response.finish_reason == "error":
                 if LLMProvider.is_arrearage_response(response):
@@ -748,6 +768,8 @@ class AgentRunner:
         kwargs["temperature"] = generation.temperature
         kwargs["max_tokens"] = generation.max_tokens
         kwargs["reasoning_effort"] = generation.reasoning_effort
+        if tools is not None and spec.initial_tool_choice is not None:
+            kwargs["tool_choice"] = spec.initial_tool_choice
         return kwargs
 
     async def _request_model(
@@ -777,6 +799,17 @@ class AgentRunner:
             messages,
             tools=spec.tools.get_definitions(),
         )
+        required_tool_name = (
+            context.directive.required_tool_name_once
+            or context.required_tool_name_once
+        )
+        if required_tool_name:
+            kwargs["tool_choice"] = {
+                "type": "function",
+                "function": {"name": required_tool_name},
+            }
+        elif context.iteration > 0:
+            kwargs.pop("tool_choice", None)
         wants_streaming = hook.wants_streaming()
         wants_progress_streaming = (
             not wants_streaming
@@ -1233,7 +1266,7 @@ class AgentRunner:
         except asyncio.CancelledError:
             raise
         except ToolSuspension as exc:
-            raise _ToolCallSuspended(tool_call, exc) from exc
+            raise _ToolCallSuspendedError(tool_call, exc) from exc
         except BaseException as exc:
             await hook.on_execute_tool_error(context, tool_call, tool, params, exc)
             event = {

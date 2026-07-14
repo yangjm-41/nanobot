@@ -3,6 +3,8 @@ from __future__ import annotations
 from typing import Any
 from unittest.mock import AsyncMock
 
+import pytest
+
 from nanobot.agent.tools.base import Tool, ToolResult
 from nanobot.agent.tools.filesystem import ReadFileTool
 from nanobot.agent.tools.registry import ToolRegistry
@@ -57,6 +59,17 @@ def test_get_definitions_orders_builtins_then_mcp_tools() -> None:
         "mcp_fs_list",
         "mcp_git_status",
     ]
+
+
+def test_select_returns_requested_tools_and_rejects_unknown_names() -> None:
+    registry = _registry_with_names(["first", "second", "third"])
+
+    selected = registry.select(["third", "first", "third"])
+
+    assert selected.tool_names == ["third", "first"]
+    assert selected.get("third") is registry.get("third")
+    with pytest.raises(ValueError, match="Unknown tool"):
+        registry.select(["missing"])
 
 
 def test_prepare_call_rejects_near_miss_tool_name_with_suggestion() -> None:

@@ -138,6 +138,8 @@ class Nanobot:
         hooks: list[AgentHook] | None = None,
         model: str | None = None,
         model_preset: str | None = None,
+        tool_allowlist: list[str] | None = None,
+        required_tool_name: str | None = None,
     ) -> RunResult:
         """Run the agent once and return the result.
 
@@ -171,6 +173,14 @@ class Nanobot:
         )
         if runtime is not None:
             kwargs["runtime"] = runtime
+        tools, initial_tool_choice = self._tool_controls(
+            tool_allowlist=tool_allowlist,
+            required_tool_name=required_tool_name,
+        )
+        if tools is not None:
+            kwargs["tools"] = tools
+        if initial_tool_choice is not None:
+            kwargs["initial_tool_choice"] = initial_tool_choice
         response = await self._loop.process_direct(
             message,
             **kwargs,
@@ -192,6 +202,8 @@ class Nanobot:
         hooks: list[AgentHook] | None = None,
         model: str | None = None,
         model_preset: str | None = None,
+        tool_allowlist: list[str] | None = None,
+        required_tool_name: str | None = None,
     ) -> RunStream:
         """Start a streamed run and return a handle for events and final result."""
         runtime = self._loop.runtime_resolver.resolve_override(
@@ -204,6 +216,10 @@ class Nanobot:
         stream_hook = SDKStreamingHook(emitter)
         capture = SDKCaptureHook()
         per_run_hooks = [capture, stream_hook, *(hooks or [])]
+        tools, initial_tool_choice = self._tool_controls(
+            tool_allowlist=tool_allowlist,
+            required_tool_name=required_tool_name,
+        )
 
         async def _on_stream(delta: str) -> None:
             await emitter.text_delta(delta)
@@ -223,6 +239,10 @@ class Nanobot:
                 on_stream_end=_on_stream_end,
             )
             kwargs["runtime"] = runtime
+            if tools is not None:
+                kwargs["tools"] = tools
+            if initial_tool_choice is not None:
+                kwargs["initial_tool_choice"] = initial_tool_choice
             await emitter.emit(StreamEvent(
                 type=STREAM_EVENT_RUN_STARTED,
                 metadata={
@@ -276,6 +296,8 @@ class Nanobot:
         hooks: list[AgentHook] | None = None,
         model: str | None = None,
         model_preset: str | None = None,
+        tool_allowlist: list[str] | None = None,
+        required_tool_name: str | None = None,
     ) -> AsyncIterator[StreamEvent]:
         """Stream events for one agent turn."""
         run = await self.run_streamed(
@@ -289,6 +311,8 @@ class Nanobot:
             hooks=hooks,
             model=model,
             model_preset=model_preset,
+            tool_allowlist=tool_allowlist,
+            required_tool_name=required_tool_name,
         )
         try:
             async for event in run.stream_events():
@@ -309,6 +333,8 @@ class Nanobot:
         hooks: list[AgentHook] | None = None,
         model: str | None = None,
         model_preset: str | None = None,
+        tool_allowlist: list[str] | None = None,
+        required_tool_name: str | None = None,
     ) -> RunStream:
         """Resume the original suspended tool call and stream the continuation."""
         runtime = self._loop.runtime_resolver.resolve_override(
@@ -321,6 +347,10 @@ class Nanobot:
         stream_hook = SDKStreamingHook(emitter)
         capture = SDKCaptureHook()
         per_run_hooks = [capture, stream_hook, *(hooks or [])]
+        tools, initial_tool_choice = self._tool_controls(
+            tool_allowlist=tool_allowlist,
+            required_tool_name=required_tool_name,
+        )
 
         async def _on_stream(delta: str) -> None:
             await emitter.text_delta(delta)
@@ -348,6 +378,8 @@ class Nanobot:
                     on_stream=_on_stream,
                     on_stream_end=_on_stream_end,
                     hooks=per_run_hooks,
+                    tools=tools,
+                    initial_tool_choice=initial_tool_choice,
                     runtime=runtime,
                 )
                 await emitter.text_completed(resuming=False, force=False)
@@ -375,6 +407,36 @@ class Nanobot:
     async def aclose(self) -> None:
         """Release resources held by this instance (MCP connections, etc.)."""
         await self._loop.close_mcp()
+
+    def _tool_controls(
+        self,
+        *,
+        tool_allowlist: list[str] | None,
+        required_tool_name: str | None,
+    ) -> tuple[Any | None, dict[str, Any] | None]:
+        """Resolve and validate tool controls for one run."""
+        effective_allowlist = tool_allowlist
+        if (
+            required_tool_name is not None
+            and effective_allowlist is not None
+            and required_tool_name not in effective_allowlist
+        ):
+            raise ValueError("required_tool_name must be present in tool_allowlist")
+
+        tools = (
+            self._loop.tools.select(effective_allowlist)
+            if effective_allowlist is not None
+            else None
+        )
+        tool_choice = (
+            {
+                "type": "function",
+                "function": {"name": required_tool_name},
+            }
+            if required_tool_name is not None
+            else None
+        )
+        return tools, tool_choice
 
     async def __aenter__(self) -> Nanobot:
         return self

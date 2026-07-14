@@ -123,6 +123,52 @@ async def test_runner_suspends_tool_without_emitting_error_or_calling_model_agai
 
 
 @pytest.mark.asyncio
+async def test_runner_applies_required_tool_choice_only_to_first_iteration():
+    from nanobot.agent.runner import AgentRunner
+
+    provider = MagicMock(spec=LLMProvider)
+    requests: list[dict] = []
+
+    async def chat_with_retry(**kwargs):
+        requests.append(kwargs)
+        if len(requests) == 1:
+            return LLMResponse(
+                content="",
+                tool_calls=[ToolCallRequest(
+                    id="call_required",
+                    name="book_ticket",
+                    arguments={},
+                )],
+            )
+        return LLMResponse(content="done", tool_calls=[])
+
+    provider.chat_with_retry = chat_with_retry
+    tools = MagicMock()
+    tools.get_definitions.return_value = [{
+        "type": "function",
+        "function": {"name": "book_ticket", "parameters": {}},
+    }]
+    tools.execute = AsyncMock(return_value={"status": "ok"})
+
+    result = await AgentRunner().run(make_run_spec(
+        provider,
+        initial_messages=[{"role": "user", "content": "buy tickets"}],
+        tools=tools,
+        model="test-model",
+        max_iterations=3,
+        max_tool_result_chars=_MAX_TOOL_RESULT_CHARS,
+        initial_tool_choice={
+            "type": "function",
+            "function": {"name": "book_ticket"},
+        },
+    ))
+
+    assert result.final_content == "done"
+    assert requests[0]["tool_choice"]["function"]["name"] == "book_ticket"
+    assert "tool_choice" not in requests[1]
+
+
+@pytest.mark.asyncio
 async def test_runner_returns_max_iterations_fallback():
     from nanobot.agent.runner import AgentRunner
 

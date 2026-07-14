@@ -85,6 +85,9 @@ async def test_composite_fans_out_all_async_methods():
         async def before_execute_tools(self, context: AgentHookContext) -> None:
             events.append("before_execute_tools")
 
+        async def before_final_response(self, context: AgentHookContext) -> None:
+            events.append("before_final_response")
+
         async def before_execute_tool(self, context, tool_call, tool, params) -> None:
             events.append("before_execute_tool")
 
@@ -117,6 +120,7 @@ async def test_composite_fans_out_all_async_methods():
     await hook.on_stream(ctx, "hi")
     await hook.on_stream_end(ctx, resuming=True)
     await hook.before_execute_tools(ctx)
+    await hook.before_final_response(ctx)
     await hook.before_execute_tool(ctx, object(), object(), {})
     await hook.after_execute_tool(ctx, object(), object(), {}, "ok")
     await hook.on_execute_tool_error(ctx, object(), object(), {}, "err")
@@ -133,6 +137,7 @@ async def test_composite_fans_out_all_async_methods():
         "on_stream:hi", "on_stream:hi",
         "on_stream_end:True", "on_stream_end:True",
         "before_execute_tools", "before_execute_tools",
+        "before_final_response", "before_final_response",
         "before_execute_tool", "before_execute_tool",
         "after_execute_tool", "after_execute_tool",
         "on_execute_tool_error", "on_execute_tool_error",

@@ -108,6 +108,23 @@ class ToolRegistry:
         self._cached_definitions = builtins + mcp_tools
         return self._cached_definitions
 
+    def select(self, names: list[str]) -> ToolRegistry:
+        """Return a registry containing only the requested registered tools.
+
+        The returned registry reuses the same Tool instances so request context,
+        MCP connections, and tool-owned runtime context providers remain intact.
+        Unknown names are rejected instead of being silently omitted.
+        """
+        requested = list(dict.fromkeys(names))
+        unknown = [name for name in requested if name not in self._tools]
+        if unknown:
+            raise ValueError(f"Unknown tool(s): {', '.join(unknown)}")
+
+        selected = ToolRegistry()
+        for name in requested:
+            selected.register(self._tools[name])
+        return selected
+
     def prepare_call(
         self,
         name: str,

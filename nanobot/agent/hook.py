@@ -13,6 +13,14 @@ from nanobot.providers.base import LLMResponse, ToolCallRequest
 
 
 @dataclass(slots=True)
+class AgentIterationDirective:
+    """Generic one-iteration control requested by an external runtime hook."""
+
+    required_tool_name_once: str | None = None
+    discard_final_response_and_continue: bool = False
+
+
+@dataclass(slots=True)
 class AgentHookContext:
     """Mutable per-iteration state exposed to runner hooks."""
 
@@ -30,6 +38,8 @@ class AgentHookContext:
     error: str | None = None
     session_key: str | None = None
     suspension: dict[str, Any] | None = None
+    required_tool_name_once: str | None = None
+    directive: AgentIterationDirective = field(default_factory=AgentIterationDirective)
 
 
 @dataclass(slots=True)
@@ -93,6 +103,9 @@ class AgentHook:
         pass
 
     async def before_execute_tools(self, context: AgentHookContext) -> None:
+        pass
+
+    async def before_final_response(self, context: AgentHookContext) -> None:
         pass
 
     async def before_execute_tool(
@@ -204,6 +217,9 @@ class CompositeHook(AgentHook):
 
     async def before_execute_tools(self, context: AgentHookContext) -> None:
         await self._for_each_hook_safe("before_execute_tools", context)
+
+    async def before_final_response(self, context: AgentHookContext) -> None:
+        await self._for_each_hook_safe("before_final_response", context)
 
     async def before_execute_tool(
         self,
