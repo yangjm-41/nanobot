@@ -144,7 +144,7 @@ class ToolResult(str):
         return cls(content, is_error=True)
 
 
-class ToolSuspension(Exception):
+class ToolSuspension(Exception):  # noqa: N818 - control-flow signal, not an error
     """Request a durable pause while a tool waits for external input.
 
     Tools should raise this exception instead of blocking.  The runner stores

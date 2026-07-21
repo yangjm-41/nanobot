@@ -6,6 +6,7 @@ import asyncio
 from collections.abc import AsyncIterator
 from contextlib import suppress
 from copy import deepcopy
+from typing import Any
 
 from nanobot.agent.hook import AgentHook, AgentHookContext
 from nanobot.sdk.types import (
