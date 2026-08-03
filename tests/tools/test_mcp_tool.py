@@ -54,8 +54,12 @@ def fake_mcp_runtime() -> dict[str, object | None]:
 
 @pytest.fixture(autouse=True)
 def _clear_proxy_env(monkeypatch: pytest.MonkeyPatch) -> None:
-    for name in (*_PROXY_ENV_VARS, "NO_PROXY", "no_proxy"):
+    for name in (*_PROXY_ENV_VARS, "no_proxy"):
         monkeypatch.delenv(name, raising=False)
+    # macOS may expose system proxy settings even when the process has no proxy
+    # environment variables. Keep these unit tests hermetic; proxy-specific tests
+    # replace this value explicitly.
+    monkeypatch.setenv("NO_PROXY", "*")
 
 
 @pytest.fixture(autouse=True)

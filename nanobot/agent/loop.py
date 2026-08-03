@@ -1996,8 +1996,9 @@ class AgentLoop:
                     "on_stream": on_stream,
                     "on_stream_end": on_stream_end,
                     "ephemeral": ephemeral,
-                    "allow_tool_suspension": allow_tool_suspension,
                 }
+                if allow_tool_suspension:
+                    kwargs["allow_tool_suspension"] = True
                 if _run_extra_hooks_for_ephemeral:
                     kwargs["run_extra_hooks_for_ephemeral"] = True
                 if hooks is not None:

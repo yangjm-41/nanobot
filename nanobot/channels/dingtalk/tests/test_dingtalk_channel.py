@@ -9,7 +9,7 @@ import pytest
 
 # Check optional dingtalk dependencies before running tests
 try:
-    from nanobot.channels import dingtalk
+    from nanobot.channels.dingtalk import runtime as dingtalk
     DINGTALK_AVAILABLE = getattr(dingtalk, "DINGTALK_AVAILABLE", False)
 except ImportError:
     DINGTALK_AVAILABLE = False
