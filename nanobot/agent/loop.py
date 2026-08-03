@@ -1472,6 +1472,7 @@ class AgentLoop:
         if isinstance(checkpoint, dict) and checkpoint.get("phase") in {
             "tool_suspended",
             "tool_result_supplied",
+            "continuation_completed",
         }:
             raise RuntimeError(
                 "session has a suspended tool call; continue it before starting a new turn"
@@ -1880,7 +1881,11 @@ class AgentLoop:
         checkpoint = session.metadata.get(self._RUNTIME_CHECKPOINT_KEY)
         if not isinstance(checkpoint, dict):
             return False
-        if checkpoint.get("phase") in {"tool_suspended", "tool_result_supplied"}:
+        if checkpoint.get("phase") in {
+            "tool_suspended",
+            "tool_result_supplied",
+            "continuation_completed",
+        }:
             return False
 
         assistant_message = checkpoint.get("assistant_message")
@@ -2046,8 +2051,10 @@ class AgentLoop:
             if not isinstance(checkpoint, dict) or checkpoint.get("phase") not in {
                 "tool_suspended",
                 "tool_result_supplied",
+                "continuation_completed",
             }:
                 raise RuntimeError("session has no suspended tool checkpoint")
+            checkpoint_phase = str(checkpoint["phase"])
 
             raw_suspension = checkpoint.get("suspension")
             if not isinstance(raw_suspension, dict):
@@ -2079,11 +2086,21 @@ class AgentLoop:
                 raise RuntimeError("suspended tool name does not match assistant history")
 
             pending_calls = checkpoint.get("pending_tool_calls")
-            if not isinstance(pending_calls, list) or len(pending_calls) != 1:
-                raise RuntimeError("suspended checkpoint must contain exactly one pending tool call")
-            pending_call = pending_calls[0]
-            if not isinstance(pending_call, dict) or pending_call.get("id") != suspension.tool_call_id:
-                raise RuntimeError("pending tool call does not match the suspension")
+            if not isinstance(pending_calls, list):
+                raise RuntimeError("suspended checkpoint pending tool calls are corrupt")
+            if checkpoint_phase == "tool_suspended":
+                if len(pending_calls) != 1:
+                    raise RuntimeError(
+                        "suspended checkpoint must contain exactly one pending tool call"
+                    )
+                pending_call = pending_calls[0]
+                if (
+                    not isinstance(pending_call, dict)
+                    or pending_call.get("id") != suspension.tool_call_id
+                ):
+                    raise RuntimeError("pending tool call does not match the suspension")
+            elif pending_calls:
+                raise RuntimeError("continued checkpoint must not contain pending tool calls")
 
             completed_messages = checkpoint.get("completed_tool_results") or []
             skipped_messages = checkpoint.get("skipped_tool_results") or []
@@ -2097,6 +2114,21 @@ class AgentLoop:
             }
             checkpoint_results = [*completed_messages, *skipped_messages]
             checkpoint_result_ids: set[str] = set()
+            resumed_checkpoint = checkpoint.get("resumed_tool_result")
+            if checkpoint_phase in {
+                "tool_result_supplied",
+                "continuation_completed",
+            }:
+                if (
+                    not isinstance(resumed_checkpoint, dict)
+                    or resumed_checkpoint.get("role") != "tool"
+                    or resumed_checkpoint.get("tool_call_id")
+                    != suspension.tool_call_id
+                    or resumed_checkpoint.get("name") != suspension.tool_name
+                ):
+                    raise RuntimeError("continued checkpoint is missing its resumed tool result")
+            elif resumed_checkpoint is not None:
+                raise RuntimeError("suspended checkpoint contains an early resumed tool result")
             for message in checkpoint_results:
                 if not isinstance(message, dict) or message.get("role") != "tool":
                     raise RuntimeError("suspended checkpoint contains an invalid tool result")
@@ -2104,8 +2136,13 @@ class AgentLoop:
                 if (
                     not tool_call_id
                     or tool_call_id not in declared_ids
-                    or tool_call_id == suspension.tool_call_id
                     or tool_call_id in checkpoint_result_ids
+                ):
+                    raise RuntimeError("suspended checkpoint contains conflicting tool results")
+                if tool_call_id == suspension.tool_call_id and (
+                    checkpoint_phase == "tool_suspended"
+                    or self._checkpoint_message_key(message)
+                    != self._checkpoint_message_key(resumed_checkpoint)
                 ):
                     raise RuntimeError("suspended checkpoint contains conflicting tool results")
                 checkpoint_result_ids.add(tool_call_id)
@@ -2185,7 +2222,29 @@ class AgentLoop:
             elif existing_result.get("content") != result_content:
                 raise RuntimeError("a different result already exists for this suspension")
             elif checkpoint.get("phase") != "tool_result_supplied":
-                raise RuntimeError("suspension checkpoint conflicts with persisted tool history")
+                if checkpoint_phase != "continuation_completed":
+                    raise RuntimeError(
+                        "suspension checkpoint conflicts with persisted tool history"
+                    )
+
+            if checkpoint_phase == "continuation_completed":
+                completed_response = checkpoint.get("continuation_response")
+                if not isinstance(completed_response, dict):
+                    raise RuntimeError("completed continuation response is missing")
+                content = completed_response.get("content")
+                stop_reason = completed_response.get("stop_reason")
+                if not isinstance(content, str) or not isinstance(stop_reason, str):
+                    raise RuntimeError("completed continuation response is corrupt")
+                if on_stream is not None and content:
+                    await on_stream(content)
+                if on_stream_end is not None:
+                    await on_stream_end(resuming=False)
+                return OutboundMessage(
+                    channel=channel,
+                    chat_id=chat_id,
+                    content=content,
+                    metadata={"_continuation_result": dict(completed_response)},
+                )
 
             effective_runtime = runtime or self.runtime_for_session(session)
             history = session.get_history(
@@ -2208,7 +2267,7 @@ class AgentLoop:
             if not bootstrap or bootstrap[0].get("role") != "system":
                 raise RuntimeError("failed to build continuation system context")
             initial_messages = [bootstrap[0], *history]
-            final_content, _, all_messages, stop_reason, _ = await self._run_agent_loop(
+            final_content, tools_used, all_messages, stop_reason, _ = await self._run_agent_loop(
                 initial_messages,
                 runtime=effective_runtime,
                 on_progress=on_progress,
@@ -2227,7 +2286,18 @@ class AgentLoop:
             )
             self._save_turn(session, all_messages, len(initial_messages))
             if stop_reason != "tool_suspended":
-                self._clear_runtime_checkpoint(session)
+                continuation_response = {
+                    "content": final_content or "",
+                    "stop_reason": stop_reason,
+                    "tools_used": list(tools_used),
+                    "usage": dict(self._last_usage),
+                }
+                checkpoint = {
+                    **checkpoint,
+                    "phase": "continuation_completed",
+                    "continuation_response": continuation_response,
+                }
+                session.metadata[self._RUNTIME_CHECKPOINT_KEY] = checkpoint
             self.sessions.save(session, fsync=True)
             if stop_reason == "tool_suspended":
                 return None
@@ -2235,4 +2305,32 @@ class AgentLoop:
                 channel=channel,
                 chat_id=chat_id,
                 content=final_content or "",
+                metadata={"_continuation_result": continuation_response},
             )
+
+    async def finalize_tool_continuation(
+        self,
+        *,
+        session_key: str,
+        suspension_id: str,
+    ) -> None:
+        """Clear a completed checkpoint only after the embedding commits its result."""
+        lock = self._session_locks.setdefault(session_key, asyncio.Lock())
+        async with lock:
+            session = self.sessions.get_or_create(session_key)
+            checkpoint = session.metadata.get(self._RUNTIME_CHECKPOINT_KEY)
+            if checkpoint is None:
+                return
+            if (
+                not isinstance(checkpoint, dict)
+                or checkpoint.get("phase") != "continuation_completed"
+            ):
+                raise RuntimeError("tool continuation is not complete")
+            raw_suspension = checkpoint.get("suspension")
+            if not isinstance(raw_suspension, dict):
+                raise RuntimeError("completed continuation is missing suspension details")
+            suspension = ToolSuspensionInfo.from_checkpoint(raw_suspension)
+            if suspension.suspension_id != suspension_id:
+                raise ValueError("suspension_id does not match the completed continuation")
+            self._clear_runtime_checkpoint(session)
+            self.sessions.save(session, fsync=True)

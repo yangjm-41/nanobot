@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from copy import deepcopy
 from types import SimpleNamespace
 from typing import Any
@@ -300,7 +301,9 @@ async def test_loop_suspends_and_continues_without_synthetic_user(loop_factory) 
 
     assert resumed is not None
     assert resumed.content == "continued"
-    assert loop._RUNTIME_CHECKPOINT_KEY not in session.metadata
+    assert session.metadata[loop._RUNTIME_CHECKPOINT_KEY]["phase"] == (
+        "continuation_completed"
+    )
     second_request = provider.chat_with_retry.await_args_list[1].kwargs["messages"]
     assistant_index = next(
         index
@@ -314,6 +317,79 @@ async def test_loop_suspends_and_continues_without_synthetic_user(loop_factory) 
         "name": "approval",
     }
     assert not any(row.get("role") == "user" for row in second_request[assistant_index + 1 :])
+
+    streamed: list[str] = []
+
+    async def capture_stream(delta: str) -> None:
+        streamed.append(delta)
+
+    cached = await loop.continue_tool_result(
+        session_key="api:control",
+        suspension_id="s-loop",
+        tool_result={"approved": True},
+        channel="api",
+        chat_id="control",
+        on_stream=capture_stream,
+        tools=tools,
+    )
+    assert cached is not None
+    assert cached.content == "continued"
+    assert streamed == ["continued"]
+    assert provider.chat_with_retry.await_count == 2
+
+    await loop.finalize_tool_continuation(
+        session_key="api:control",
+        suspension_id="s-loop",
+    )
+    assert loop._RUNTIME_CHECKPOINT_KEY not in session.metadata
+
+
+@pytest.mark.asyncio
+async def test_loop_reenters_after_result_checkpoint_was_saved(loop_factory) -> None:
+    tools = ToolRegistry()
+    tools.register(_StaticTool("approval", ToolSuspension("s-reenter")))
+    provider = _provider(
+        LLMResponse(
+            content=None,
+            tool_calls=[
+                ToolCallRequest(id="call-reenter", name="approval", arguments={})
+            ],
+            finish_reason="tool_calls",
+        ),
+        asyncio.CancelledError(),
+        LLMResponse(content="reentered"),
+    )
+    provider.get_default_model.return_value = "test-model"
+    loop = loop_factory(provider=provider)
+    loop.consolidator.maybe_consolidate_by_tokens = AsyncMock(return_value=None)
+
+    await loop.process_direct(
+        "start",
+        session_key="api:reenter",
+        tools=tools,
+        allow_tool_suspension=True,
+    )
+    with pytest.raises(asyncio.CancelledError):
+        await loop.continue_tool_result(
+            session_key="api:reenter",
+            suspension_id="s-reenter",
+            tool_result={"approved": True},
+            tools=tools,
+        )
+
+    session = loop.sessions.get_or_create("api:reenter")
+    assert session.metadata[loop._RUNTIME_CHECKPOINT_KEY]["phase"] == (
+        "tool_result_supplied"
+    )
+    resumed = await loop.continue_tool_result(
+        session_key="api:reenter",
+        suspension_id="s-reenter",
+        tool_result={"approved": True},
+        tools=tools,
+    )
+    assert resumed is not None
+    assert resumed.content == "reentered"
+    assert provider.chat_with_retry.await_count == 3
 
 
 @pytest.mark.asyncio
