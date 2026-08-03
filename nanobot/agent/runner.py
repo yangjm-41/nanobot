@@ -16,6 +16,11 @@ from nanobot.agent.context_governance import (
     ContextGovernanceConfig,
     ContextGovernor,
 )
+from nanobot.agent.control import (
+    AgentIterationDirective,
+    ToolSuspension,
+    ToolSuspensionInfo,
+)
 from nanobot.agent.hook import AgentHook, AgentHookContext, AgentRunHookContext
 from nanobot.agent.tools.registry import ToolRegistry, is_tool_error_result
 from nanobot.providers.base import LLMProvider, LLMResponse, ToolCallRequest
@@ -82,6 +87,7 @@ class AgentRunSpec:
     goal_active_predicate: Callable[[], bool] | None = None
     goal_continue_message: GoalContinueMessage | None = None
     finalize_on_max_iterations: bool = True
+    allow_tool_suspension: bool = False
 
 
 @dataclass(slots=True)
@@ -96,6 +102,18 @@ class AgentRunResult:
     error: str | None = None
     tool_events: list[dict[str, str]] = field(default_factory=list)
     had_injections: bool = False
+    suspension: ToolSuspensionInfo | None = None
+
+
+class _ToolCallSuspendedError(Exception):
+    """Internal carrier that keeps a suspension paired with its model call."""
+
+    def __init__(self, tool_call: ToolCallRequest, suspension: ToolSuspension) -> None:
+        self.tool_call = tool_call
+        self.suspension = suspension
+        self.tool_call_index = 0
+        self.completed: list[tuple[Any, dict[str, str], BaseException | None]] = []
+        super().__init__(str(suspension))
 
 
 class AgentRunner:
@@ -300,6 +318,7 @@ class AgentRunner:
             context.error = result.error
             context.tool_events = deepcopy(result.tool_events)
             context.had_injections = result.had_injections
+            context.suspension = deepcopy(result.suspension)
             context.exception = None
             if context.error is not None:
                 await hook.on_error(context)
@@ -336,8 +355,10 @@ class AgentRunner:
         empty_content_retries = 0
         length_recovery_count = 0
         had_injections = False
+        suspension: ToolSuspensionInfo | None = None
         injection_cycles = 0
         compacted_tool_call_ids: set[str] = set()
+        pending_required_tool_name: str | None = None
         governance_config = ContextGovernanceConfig(
             provider=spec.runtime.provider,
             model=spec.runtime.model,
@@ -366,7 +387,11 @@ class AgentRunner:
                 iteration=iteration,
                 messages=messages,
                 session_key=spec.session_key,
+                directive=AgentIterationDirective(
+                    required_tool_name_once=pending_required_tool_name,
+                ),
             )
+            pending_required_tool_name = None
             await hook.before_iteration(context)
             response = await self._request_model(spec, messages_for_model, hook, context)
             context.response = response
@@ -412,14 +437,86 @@ class AgentRunner:
 
                 await hook.before_execute_tools(context)
 
-                results, new_events, fatal_error = await self._execute_tools(
-                    spec,
-                    response.tool_calls,
-                    external_lookup_counts,
-                    workspace_violation_counts,
-                    hook,
-                    context,
-                )
+                try:
+                    results, new_events, fatal_error = await self._execute_tools(
+                        spec,
+                        response.tool_calls,
+                        external_lookup_counts,
+                        workspace_violation_counts,
+                        hook,
+                        context,
+                    )
+                except _ToolCallSuspendedError as exc:
+                    completed_tool_results: list[dict[str, Any]] = []
+                    for completed_call, (result, event, completed_error) in zip(
+                        response.tool_calls[: exc.tool_call_index],
+                        exc.completed,
+                    ):
+                        tool_events.append(event)
+                        if event.get("status") == "ok":
+                            tools_used.append(completed_call.name)
+                        tool_message = {
+                            "role": "tool",
+                            "tool_call_id": completed_call.id,
+                            "name": completed_call.name,
+                            "content": self.context_governor.normalize_tool_result(
+                                governance_config,
+                                completed_call.id,
+                                completed_call.name,
+                                result,
+                            ),
+                        }
+                        messages.append(tool_message)
+                        completed_tool_results.append(tool_message)
+                        if completed_error is not None:
+                            logger.warning(
+                                "Tool {} failed before a later call suspended: {}",
+                                completed_call.name,
+                                completed_error,
+                            )
+
+                    skipped_tool_results = [
+                        {
+                            "role": "tool",
+                            "tool_call_id": pending_call.id,
+                            "name": pending_call.name,
+                            "content": (
+                                "Error: Tool call was not executed because an earlier "
+                                "tool call suspended."
+                            ),
+                        }
+                        for pending_call in response.tool_calls[exc.tool_call_index + 1 :]
+                    ]
+                    suspension = ToolSuspensionInfo(
+                        suspension_id=exc.suspension.suspension_id,
+                        tool_call_id=exc.tool_call.id,
+                        tool_name=exc.tool_call.name,
+                        arguments=deepcopy(exc.tool_call.arguments),
+                        assistant_message=deepcopy(assistant_message),
+                        metadata=deepcopy(exc.suspension.metadata),
+                    )
+                    context.suspension = suspension
+                    context.tool_results = [item[0] for item in exc.completed]
+                    context.tool_events = [item[1] for item in exc.completed]
+                    context.stop_reason = "tool_suspended"
+                    stop_reason = "tool_suspended"
+                    final_content = None
+                    await self._emit_checkpoint(
+                        spec,
+                        {
+                            "phase": "tool_suspended",
+                            "iteration": iteration,
+                            "model": spec.runtime.model,
+                            "assistant_message": assistant_message,
+                            "completed_tool_results": completed_tool_results,
+                            "pending_tool_calls": [exc.tool_call.to_openai_tool_call()],
+                            "skipped_tool_results": skipped_tool_results,
+                            "suspension": suspension.to_checkpoint(),
+                        },
+                    )
+                    await hook.on_tool_suspended(context, suspension)
+                    await hook.after_iteration(context)
+                    break
                 tool_events.extend(new_events)
                 tools_used.extend(
                     tool_call.name
@@ -552,6 +649,18 @@ class AgentRunner:
                     thinking_blocks=response.thinking_blocks,
                 )
 
+                context.final_content = clean
+                context.stop_reason = stop_reason
+                await hook.before_final_response(context)
+                if context.directive.discard_final_response_and_continue:
+                    pending_required_tool_name = context.directive.required_tool_name_once
+                    context.final_content = None
+                    context.stop_reason = None
+                    if hook.wants_streaming():
+                        await hook.on_stream_end(context, resuming=True)
+                    await hook.after_iteration(context)
+                    continue
+
             # Check for mid-turn injections BEFORE signaling stream end.
             # If injections are found we keep the stream alive (resuming=True)
             # so streaming channels don't prematurely finalize the card.
@@ -664,6 +773,7 @@ class AgentRunner:
             error=error,
             tool_events=tool_events,
             had_injections=had_injections,
+            suspension=suspension,
         )
 
     def _build_request_kwargs(
@@ -708,11 +818,29 @@ class AgentRunner:
         if timeout_s is not None and timeout_s <= 0:
             timeout_s = None
 
+        tool_definitions = spec.tools.get_definitions()
+        required_tool_name = context.directive.required_tool_name_once
+        if required_tool_name is not None:
+            required_tool_name = required_tool_name.strip()
+            if not required_tool_name:
+                raise ValueError("required_tool_name_once must not be empty")
+            tool_definitions = [
+                definition
+                for definition in tool_definitions
+                if (definition.get("function") or {}).get("name") == required_tool_name
+            ]
+            if len(tool_definitions) != 1:
+                raise ValueError(
+                    f"required tool is unavailable in this run: {required_tool_name}"
+                )
+
         kwargs = self._build_request_kwargs(
             spec,
             messages,
-            tools=spec.tools.get_definitions(),
+            tools=tool_definitions,
         )
+        if required_tool_name is not None:
+            kwargs["tool_choice"] = "required"
         wants_streaming = hook.wants_streaming()
         wants_progress_streaming = (
             not wants_streaming
@@ -1103,6 +1231,31 @@ class AgentRunner:
     ) -> tuple[list[Any], list[dict[str, str]], BaseException | None]:
         hook = hook or AgentHook()
         context = context or AgentHookContext(iteration=0, messages=[])
+        if spec.allow_tool_suspension:
+            tool_results: list[tuple[Any, dict[str, str], BaseException | None]] = []
+            for index, tool_call in enumerate(tool_calls):
+                try:
+                    result = await self._run_tool(
+                        spec,
+                        tool_call,
+                        external_lookup_counts,
+                        workspace_violation_counts,
+                        hook,
+                        context,
+                    )
+                except _ToolCallSuspendedError as exc:
+                    exc.tool_call_index = index
+                    exc.completed = list(tool_results)
+                    raise
+                tool_results.append(result)
+            results = [item[0] for item in tool_results]
+            events = [item[1] for item in tool_results]
+            fatal_error = next(
+                (item[2] for item in tool_results if item[2] is not None),
+                None,
+            )
+            return results, events, fatal_error
+
         batches = self._partition_tool_batches(spec, tool_calls)
         tool_results: list[tuple[Any, dict[str, str], BaseException | None]] = []
         for batch in batches:
@@ -1201,6 +1354,19 @@ class AgentRunner:
                 result = await spec.tools.execute(tool_call.name, params)
         except asyncio.CancelledError:
             raise
+        except ToolSuspension as exc:
+            if spec.allow_tool_suspension:
+                raise _ToolCallSuspendedError(tool_call, exc) from exc
+            await hook.on_execute_tool_error(context, tool_call, tool, params, exc)
+            event = {
+                "name": tool_call.name,
+                "status": "error",
+                "detail": str(exc),
+            }
+            payload = f"Error: {type(exc).__name__}: {exc}"
+            if spec.fail_on_tool_error:
+                return payload, event, exc
+            return payload, event, None
         except Exception as exc:
             await hook.on_execute_tool_error(context, tool_call, tool, params, exc)
             event = {

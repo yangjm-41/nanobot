@@ -9,6 +9,7 @@ from typing import Any
 
 from loguru import logger
 
+from nanobot.agent.control import AgentIterationDirective, ToolSuspensionInfo
 from nanobot.providers.base import LLMResponse, ToolCallRequest
 
 
@@ -29,6 +30,8 @@ class AgentHookContext:
     stop_reason: str | None = None
     error: str | None = None
     session_key: str | None = None
+    directive: AgentIterationDirective = field(default_factory=AgentIterationDirective)
+    suspension: ToolSuspensionInfo | None = None
 
 
 @dataclass(slots=True)
@@ -43,6 +46,7 @@ class AgentRunHookContext:
     error: str | None = None
     tool_events: list[dict[str, str]] = field(default_factory=list)
     had_injections: bool = False
+    suspension: ToolSuspensionInfo | None = None
     exception: BaseException | None = None
 
 
@@ -130,6 +134,13 @@ class AgentHook:
     ) -> None:
         pass
 
+    async def on_tool_suspended(
+        self,
+        context: AgentHookContext,
+        suspension: ToolSuspensionInfo,
+    ) -> None:
+        pass
+
     async def emit_reasoning(self, reasoning_content: str | None) -> None:
         pass
 
@@ -142,6 +153,9 @@ class AgentHook:
         pass
 
     async def after_iteration(self, context: AgentHookContext) -> None:
+        pass
+
+    async def before_final_response(self, context: AgentHookContext) -> None:
         pass
 
     def finalize_content(self, context: AgentHookContext, content: str | None) -> str | None:
@@ -253,6 +267,13 @@ class CompositeHook(AgentHook):
             error,
         )
 
+    async def on_tool_suspended(
+        self,
+        context: AgentHookContext,
+        suspension: ToolSuspensionInfo,
+    ) -> None:
+        await self._for_each_hook_safe("on_tool_suspended", context, suspension)
+
     async def emit_reasoning(self, reasoning_content: str | None) -> None:
         await self._for_each_hook_safe("emit_reasoning", reasoning_content)
 
@@ -261,6 +282,9 @@ class CompositeHook(AgentHook):
 
     async def after_iteration(self, context: AgentHookContext) -> None:
         await self._for_each_hook_safe("after_iteration", context)
+
+    async def before_final_response(self, context: AgentHookContext) -> None:
+        await self._for_each_hook_safe("before_final_response", context)
 
     def finalize_content(self, context: AgentHookContext, content: str | None) -> str | None:
         for h in self._hooks:
@@ -287,6 +311,7 @@ class SDKCaptureHook(AgentHook):
         self.error: str | None = None
         self.tool_events: list[dict[str, str]] = []
         self.had_injections: bool = False
+        self.suspension: ToolSuspensionInfo | None = None
 
     async def after_iteration(self, context: AgentHookContext) -> None:
         for call in context.tool_calls:
@@ -305,3 +330,4 @@ class SDKCaptureHook(AgentHook):
         self.error = context.error
         self.tool_events = list(context.tool_events)
         self.had_injections = context.had_injections
+        self.suspension = context.suspension

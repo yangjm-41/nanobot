@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import json
 import os
 import time
 from collections.abc import Mapping
@@ -21,6 +22,7 @@ from nanobot.agent import model_presets as preset_helpers
 from nanobot.agent.autocompact import AutoCompact
 from nanobot.agent.automation_turns import publish_next_deferred_turn
 from nanobot.agent.context import ContextBuilder
+from nanobot.agent.control import ToolSuspensionInfo
 from nanobot.agent.cron_turns import CronTurnCoordinator
 from nanobot.agent.hook import AgentHook, AgentTurnHookFactory
 from nanobot.agent.memory import Consolidator
@@ -149,6 +151,7 @@ class TurnContext:
     all_messages: list[dict[str, Any]] = field(default_factory=list)
     stop_reason: str = ""
     had_injections: bool = False
+    suspension: ToolSuspensionInfo | None = None
     streamed_content: bool = False
 
     input_persisted_early: bool = False
@@ -172,6 +175,7 @@ class TurnContext:
     hook_factories: list[AgentTurnHookFactory] = field(default_factory=list)
     turn_scopes: list[AbstractContextManager[Any]] = field(default_factory=list)
     tools: ToolRegistry | None = None
+    allow_tool_suspension: bool = False
 
     turn_wall_started_at: float = field(default_factory=time.time)
     visible_run_started_at: float | None = None
@@ -826,6 +830,7 @@ class AgentLoop:
         turn_scopes: list[AbstractContextManager[Any]] | None = None,
         tools: ToolRegistry | None = None,
         request_context: RequestContext | None = None,
+        allow_tool_suspension: bool = False,
     ) -> tuple[str | None, list[str], list[dict], str, bool]:
         """Run the agent iteration loop.
 
@@ -971,7 +976,8 @@ class AgentLoop:
                 max_tool_result_chars=self.max_tool_result_chars,
                 hook=hook,
                 error_message="Sorry, I encountered an error calling the AI model.",
-                concurrent_tools=True,
+                concurrent_tools=not allow_tool_suspension,
+                allow_tool_suspension=allow_tool_suspension,
                 workspace=effective_scope.project_path,
                 session_key=session.key if session else None,
                 context_block_limit=self.context_block_limit,
@@ -1275,6 +1281,7 @@ class AgentLoop:
         runtime: LLMRuntime | None = None,
         delivery: TurnDelivery | None = None,
         on_runtime_admitted: Callable[[LLMRuntime], Awaitable[None]] | None = None,
+        allow_tool_suspension: bool = False,
     ) -> OutboundMessage | None:
         """Process a single inbound message and return the response."""
         kind = TurnKind.SYSTEM if msg.channel == "system" else TurnKind.USER
@@ -1323,6 +1330,7 @@ class AgentLoop:
             hooks=list(hooks or []),
             hook_factories=list(hook_factories or []),
             tools=tools,
+            allow_tool_suspension=allow_tool_suspension,
         )
         # A streaming callback may be present even when the final text comes from a
         # non-streaming recovery. Only the last completed segment can suppress the
@@ -1460,6 +1468,14 @@ class AgentLoop:
         if ctx.kind is TurnKind.USER:
             self.workspace_scopes.persist_message_scope(ctx.session, msg)
 
+        checkpoint = ctx.session.metadata.get(self._RUNTIME_CHECKPOINT_KEY)
+        if isinstance(checkpoint, dict) and checkpoint.get("phase") in {
+            "tool_suspended",
+            "tool_result_supplied",
+        }:
+            raise RuntimeError(
+                "session has a suspended tool call; continue it before starting a new turn"
+            )
         if self._restore_runtime_checkpoint(ctx.session):
             self.sessions.save(ctx.session)
         if self._restore_pending_user_turn(ctx.session):
@@ -1607,6 +1623,7 @@ class AgentLoop:
             turn_scopes=ctx.turn_scopes,
             tools=ctx.tools,
             request_context=ctx.request_context,
+            allow_tool_suspension=ctx.allow_tool_suspension,
         )
         final_content, tools_used, all_msgs, stop_reason, had_injections = result
         ctx.final_content = final_content
@@ -1614,12 +1631,17 @@ class AgentLoop:
         ctx.all_messages = all_msgs
         ctx.stop_reason = stop_reason
         ctx.had_injections = had_injections
-        if ctx.kind is TurnKind.USER:
+        if ctx.kind is TurnKind.USER and ctx.stop_reason != "tool_suspended":
             await turn_continuation.maybe_continue_turn(ctx)
         return "ok"
 
     async def _state_save(self, ctx: TurnContext) -> str:
         turn_continuation.prepare_save_boundary(ctx)
+
+        tool_suspended = ctx.stop_reason == "tool_suspended"
+        if tool_suspended:
+            ctx.final_content = None
+            ctx.suppress_response = True
 
         if (
             ctx.kind is TurnKind.USER
@@ -1655,9 +1677,10 @@ class AgentLoop:
                         ctx.runtime.context_window_tokens
                     ),
                 )
-            )
+        )
         self._clear_pending_user_turn(ctx.session)
-        self._clear_runtime_checkpoint(ctx.session)
+        if not tool_suspended:
+            self._clear_runtime_checkpoint(ctx.session)
         self.sessions.save(ctx.session)
         return "ok"
 
@@ -1857,6 +1880,8 @@ class AgentLoop:
         checkpoint = session.metadata.get(self._RUNTIME_CHECKPOINT_KEY)
         if not isinstance(checkpoint, dict):
             return False
+        if checkpoint.get("phase") in {"tool_suspended", "tool_result_supplied"}:
+            return False
 
         assistant_message = checkpoint.get("assistant_message")
         completed_tool_results = checkpoint.get("completed_tool_results") or []
@@ -1943,6 +1968,7 @@ class AgentLoop:
         persist_user_message: bool = True,
         runtime: LLMRuntime | None = None,
         on_runtime_admitted: Callable[[LLMRuntime], Awaitable[None]] | None = None,
+        allow_tool_suspension: bool = False,
     ) -> OutboundMessage | None:
         """Process an external message directly and return the outbound payload."""
         if channel == "system":
@@ -1965,6 +1991,7 @@ class AgentLoop:
                     "on_stream": on_stream,
                     "on_stream_end": on_stream_end,
                     "ephemeral": ephemeral,
+                    "allow_tool_suspension": allow_tool_suspension,
                 }
                 if _run_extra_hooks_for_ephemeral:
                     kwargs["run_extra_hooks_for_ephemeral"] = True
@@ -1985,3 +2012,227 @@ class AgentLoop:
         finally:
             await self._runtime_events().run_status_changed(msg, session_key, "idle")
             self._runtime_events().clear_turn(session_key)
+
+    async def continue_tool_result(
+        self,
+        *,
+        session_key: str,
+        suspension_id: str,
+        tool_result: Any,
+        channel: str = "cli",
+        chat_id: str = "direct",
+        on_progress: Callable[..., Awaitable[None]] | None = None,
+        on_stream: Callable[[str], Awaitable[None]] | None = None,
+        on_stream_end: Callable[..., Awaitable[None]] | None = None,
+        on_retry_wait: Callable[[str], Awaitable[None]] | None = None,
+        hooks: list[AgentHook] | None = None,
+        hook_factories: list[AgentTurnHookFactory] | None = None,
+        tools: ToolRegistry | None = None,
+        runtime: LLMRuntime | None = None,
+    ) -> OutboundMessage | None:
+        """Atomically continue a suspended tool call without a synthetic user turn.
+
+        The persisted assistant call is authoritative.  A missing, conflicting,
+        or damaged checkpoint fails explicitly so an embedding can apply its own
+        retry and idempotency policy without the core guessing at history.
+        """
+        if not isinstance(suspension_id, str) or not suspension_id.strip():
+            raise ValueError("suspension_id must not be empty")
+        await self._connect_mcp()
+        lock = self._session_locks.setdefault(session_key, asyncio.Lock())
+        async with lock:
+            session = self.sessions.get_or_create(session_key)
+            checkpoint = session.metadata.get(self._RUNTIME_CHECKPOINT_KEY)
+            if not isinstance(checkpoint, dict) or checkpoint.get("phase") not in {
+                "tool_suspended",
+                "tool_result_supplied",
+            }:
+                raise RuntimeError("session has no suspended tool checkpoint")
+
+            raw_suspension = checkpoint.get("suspension")
+            if not isinstance(raw_suspension, dict):
+                raise RuntimeError("suspended checkpoint is missing suspension details")
+            suspension = ToolSuspensionInfo.from_checkpoint(raw_suspension)
+            if suspension.suspension_id != suspension_id:
+                raise ValueError("suspension_id does not match the session checkpoint")
+
+            assistant_message = checkpoint.get("assistant_message")
+            if not isinstance(assistant_message, dict):
+                raise RuntimeError("suspended checkpoint is missing assistant_message")
+            if self._checkpoint_message_key(assistant_message) != self._checkpoint_message_key(
+                suspension.assistant_message
+            ):
+                raise RuntimeError("suspended checkpoint contains conflicting assistant messages")
+
+            assistant_calls = assistant_message.get("tool_calls")
+            if not isinstance(assistant_calls, list):
+                raise RuntimeError("suspended assistant message has no tool calls")
+            matching_calls = [
+                call
+                for call in assistant_calls
+                if isinstance(call, dict) and call.get("id") == suspension.tool_call_id
+            ]
+            if len(matching_calls) != 1:
+                raise RuntimeError("suspended tool call is missing or duplicated")
+            function = matching_calls[0].get("function")
+            if not isinstance(function, dict) or function.get("name") != suspension.tool_name:
+                raise RuntimeError("suspended tool name does not match assistant history")
+
+            pending_calls = checkpoint.get("pending_tool_calls")
+            if not isinstance(pending_calls, list) or len(pending_calls) != 1:
+                raise RuntimeError("suspended checkpoint must contain exactly one pending tool call")
+            pending_call = pending_calls[0]
+            if not isinstance(pending_call, dict) or pending_call.get("id") != suspension.tool_call_id:
+                raise RuntimeError("pending tool call does not match the suspension")
+
+            completed_messages = checkpoint.get("completed_tool_results") or []
+            skipped_messages = checkpoint.get("skipped_tool_results") or []
+            if not isinstance(completed_messages, list) or not isinstance(skipped_messages, list):
+                raise RuntimeError("suspended checkpoint tool results are corrupt")
+
+            declared_ids = {
+                str(call.get("id"))
+                for call in assistant_calls
+                if isinstance(call, dict) and call.get("id")
+            }
+            checkpoint_results = [*completed_messages, *skipped_messages]
+            checkpoint_result_ids: set[str] = set()
+            for message in checkpoint_results:
+                if not isinstance(message, dict) or message.get("role") != "tool":
+                    raise RuntimeError("suspended checkpoint contains an invalid tool result")
+                tool_call_id = str(message.get("tool_call_id") or "")
+                if (
+                    not tool_call_id
+                    or tool_call_id not in declared_ids
+                    or tool_call_id == suspension.tool_call_id
+                    or tool_call_id in checkpoint_result_ids
+                ):
+                    raise RuntimeError("suspended checkpoint contains conflicting tool results")
+                checkpoint_result_ids.add(tool_call_id)
+
+            assistant_index = next(
+                (
+                    index
+                    for index in range(len(session.messages) - 1, -1, -1)
+                    if self._checkpoint_message_key(session.messages[index])
+                    == self._checkpoint_message_key(assistant_message)
+                ),
+                None,
+            )
+            if assistant_index is None:
+                self._save_turn(session, [assistant_message, *completed_messages], 0)
+            else:
+                for message in completed_messages:
+                    existing = next(
+                        (
+                            row
+                            for row in session.messages[assistant_index + 1 :]
+                            if row.get("role") == "tool"
+                            and row.get("tool_call_id") == message.get("tool_call_id")
+                        ),
+                        None,
+                    )
+                    if existing is None:
+                        self._save_turn(session, [message], 0)
+                    elif existing.get("content") != message.get("content"):
+                        raise RuntimeError("persisted tool result conflicts with checkpoint")
+
+            if isinstance(tool_result, str):
+                result_content = tool_result
+            else:
+                try:
+                    result_content = json.dumps(
+                        tool_result,
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    )
+                except (TypeError, ValueError) as exc:
+                    raise ValueError("tool_result must be JSON serializable") from exc
+
+            existing_result = next(
+                (
+                    row
+                    for row in session.messages
+                    if row.get("role") == "tool"
+                    and row.get("tool_call_id") == suspension.tool_call_id
+                ),
+                None,
+            )
+            if existing_result is None:
+                if checkpoint.get("phase") != "tool_suspended":
+                    raise RuntimeError("continued checkpoint is missing its persisted tool result")
+                resumed_message = {
+                    "role": "tool",
+                    "tool_call_id": suspension.tool_call_id,
+                    "name": suspension.tool_name,
+                    "content": result_content,
+                }
+                self._save_turn(session, [resumed_message, *skipped_messages], 0)
+                checkpoint = {
+                    **checkpoint,
+                    "phase": "tool_result_supplied",
+                    "completed_tool_results": [
+                        *completed_messages,
+                        resumed_message,
+                        *skipped_messages,
+                    ],
+                    "pending_tool_calls": [],
+                    "skipped_tool_results": [],
+                    "resumed_tool_result": resumed_message,
+                }
+                session.metadata[self._RUNTIME_CHECKPOINT_KEY] = checkpoint
+                self.sessions.save(session, fsync=True)
+            elif existing_result.get("content") != result_content:
+                raise RuntimeError("a different result already exists for this suspension")
+            elif checkpoint.get("phase") != "tool_result_supplied":
+                raise RuntimeError("suspension checkpoint conflicts with persisted tool history")
+
+            effective_runtime = runtime or self.runtime_for_session(session)
+            history = session.get_history(
+                max_messages=replay_max_messages_for_context(
+                    effective_runtime.context_window_tokens
+                ),
+                max_tokens=self._replay_token_budget(effective_runtime),
+                extend_to_user=False,
+            )
+            bootstrap = self.context.build_messages(
+                history=[],
+                current_message="",
+                channel=channel,
+                chat_id=chat_id,
+                session_metadata=session.metadata,
+                workspace=self.workspace,
+                session_key=session_key,
+                unified_session=self._unified_session,
+            )
+            if not bootstrap or bootstrap[0].get("role") != "system":
+                raise RuntimeError("failed to build continuation system context")
+            initial_messages = [bootstrap[0], *history]
+            final_content, _, all_messages, stop_reason, _ = await self._run_agent_loop(
+                initial_messages,
+                runtime=effective_runtime,
+                on_progress=on_progress,
+                on_stream=on_stream,
+                on_stream_end=on_stream_end,
+                on_retry_wait=on_retry_wait,
+                session=session,
+                channel=channel,
+                chat_id=chat_id,
+                session_key=session_key,
+                original_user_text=None,
+                hooks=hooks,
+                hook_factories=hook_factories,
+                tools=tools,
+                allow_tool_suspension=True,
+            )
+            self._save_turn(session, all_messages, len(initial_messages))
+            if stop_reason != "tool_suspended":
+                self._clear_runtime_checkpoint(session)
+            self.sessions.save(session, fsync=True)
+            if stop_reason == "tool_suspended":
+                return None
+            return OutboundMessage(
+                channel=channel,
+                chat_id=chat_id,
+                content=final_content or "",
+            )
