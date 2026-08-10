@@ -794,11 +794,19 @@ class ExecTool(Tool):
 
     @staticmethod
     def _extract_absolute_paths(command: str) -> list[str]:
-        # Windows: match drive-root paths like `C:\` as well as `C:\path\to\file`, and UNC paths like `\\server\share`
-        # NOTE: `*` is required so `C:\` (nothing after the slash) is still extracted.
+        # A Windows drive path is absolute only when the colon is followed by
+        # a separator.  Bare tokens such as ``f:`` are drive-relative on
+        # Windows and also occur commonly in source code (for example
+        # ``with open(...) as f:``), so treating them as absolute paths causes
+        # false workspace-boundary violations on POSIX hosts.
         win_paths = re.findall(
-            r"(?<![A-Za-z])(?:[A-Za-z]:[^\s\"'|><;]*|\\\\[^\s\"'|><;]+(?:\\[^\s\"'|><;]+)*)",
-            command
+            (
+                r"(?<![A-Za-z])(?:"
+                r"[A-Za-z]:[\\/][^\s\"'|><;]*"
+                r"|\\\\[^\s\"'|><;]+(?:\\[^\s\"'|><;]+)*"
+                r")"
+            ),
+            command,
         )
         posix_paths = re.findall(r"(?:^|[\s|>'\"])(/[^\s\"'>;|<]+)", command) # POSIX: /absolute only
         home_paths = re.findall(r"(?:^|[\s>'\"])(~[^\s\"'>;|<]*)", command) # POSIX/Windows home shortcut: ~

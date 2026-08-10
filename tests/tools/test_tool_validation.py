@@ -236,6 +236,23 @@ def test_exec_extract_absolute_paths_captures_windows_drive_root_path() -> None:
     assert paths == ["E:\\"]
 
 
+def test_exec_extract_absolute_paths_ignores_drive_relative_tokens() -> None:
+    cmd = 'python3 -c "with open(\'content.json\', \'w\') as f: f.write(\'{}\')"'
+    paths = ExecTool._extract_absolute_paths(cmd)
+    assert paths == []
+
+
+def test_exec_guard_allows_python_context_manager_variable(tmp_path) -> None:
+    cmd = 'python3 -c "with open(\'content.json\', \'w\') as f: f.write(\'{}\')"'
+    tool = ExecTool(working_dir=str(tmp_path), restrict_to_workspace=True)
+    error = tool._guard_command(
+        cmd,
+        str(tmp_path),
+        workspace_root=str(tmp_path),
+    )
+    assert error is None
+
+
 def test_exec_extract_absolute_paths_ignores_relative_posix_segments() -> None:
     cmd = ".venv/bin/python script.py"
     paths = ExecTool._extract_absolute_paths(cmd)
